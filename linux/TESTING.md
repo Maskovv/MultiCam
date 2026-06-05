@@ -1,13 +1,82 @@
 # Как мы тестируем порт (Ubuntu 22.04 VM → потом Jetson)
 
-Тестирование делится на **3 уровня**. В виртуалке без камеры проходят уровни 1–2,
-полностью «живой» уровень 3 — на реальном Jetson с подключённой камерой.
+Тестирование делится на **3 уровня**:
 
 ```
-Уровень 1: формулы и парсеры        → VM, без камеры, без OpenCV   (есть сейчас)
-Уровень 2: офлайн-пайплайн на кадре  → VM, без камеры, с OpenCV     (есть сейчас)
-Уровень 3: живой захват с камеры     → Jetson + libnncam.so + USB   (код готов, нужно железо)
+Уровень 1: формулы и парсеры        → VM, без камеры, без OpenCV   (✅ проверено)
+Уровень 2: офлайн-пайплайн на кадре  → VM, без камеры, с OpenCV     (✅ проверено)
+Уровень 3: живой захват с камеры     → камера по USB + libnncam.so  (✅ проверено в VirtualBox!)
 ```
+
+> ✅ **Статус:** живой захват кадра 2048×2048 с камеры `BigEye4200KME` получен на
+> Ubuntu в VirtualBox через `libnncam.so` — без Windows и без штатного `.exe`.
+> Цепочка «камера → Linux-SDK → кадр → файл» работает.
+
+---
+
+## ⭐ Быстрый сквозной прогон (все команды по порядку)
+
+Это «шпаргалка»: команды друг за другом, как мы реально запускали. Реальная раскладка
+в VM: проект в `~/obshaya`, venv в `~/venvs/multicam`, библиотека и udev-правило в
+`~/obshaya`. Пути при необходимости подставь свои.
+
+```bash
+# (0) Активировать окружение и перейти в проект
+source ~/venvs/multicam/bin/activate
+cd ~/obshaya
+
+# (1) Самопроверка формул индексов (без камеры) — должно быть "ВСЕ ИНДЕКСЫ СОВПАЛИ"
+python -m multicam.cli selftest
+
+# (2) Полный набор юнит-тестов (без камеры)
+pytest -v
+
+# (3) Офлайн-обработка реального кадра (без камеры): кадр -> каналы -> индексы
+python -m multicam.cli process \
+  --object Reference/fr_14_41_17_557.bmp \
+  --reference Reference/fr_14_41_17_557.bmp \
+  --distance 1.0 --calibration-dir . \
+  --roi 100 400 100 400 \
+  --output result.txt
+
+# (4) Диагностика окружения перед камерой (платформа, зависимости, SDK, USB)
+python -m multicam.cli doctor --lib ~/obshaya/libnncam.so
+
+# (5) ОДИН РАЗ: установить udev-правило для доступа к камере без sudo,
+#     затем ФИЗИЧЕСКИ переподключить камеру (вынуть-вставить USB)
+sudo cp ~/obshaya/99-toupcam.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+# (6) Проверить, что Linux видит камеру по USB
+lsusb
+
+# (7) Найти камеру через SDK
+python -m multicam.cli probe --lib ~/obshaya/libnncam.so
+
+# (8) Захватить кадры с камеры в папку captures/
+#     По умолчанию PNG (16 бит, без потерь). Для научного анализа/GeoTIFF: --format tiff.
+#     Для точного numpy-массива без OpenCV: --format npy.
+#     В VirtualBox поток USB3 нестабилен — помогают --interval (пауза) и --retries.
+python -m multicam.cli capture --backend nncam --count 5 \
+  --exposure 10000 --lib ~/obshaya/libnncam.so --output-dir captures \
+  --format tiff --interval 1.0 --retries 5
+
+# (9) Прогнать реально снятый кадр через обработку
+#     (пока object = reference, просто чтобы проверить, что пайплайн ест живой кадр)
+python -m multicam.cli process \
+  --object captures/frame_0000.png \
+  --reference captures/frame_0000.png \
+  --distance 1.0 --calibration-dir . \
+  --roi 100 400 100 400
+```
+
+> Если в твоей раскладке проект лежит в `~/obshaya/linux`, а калибровки/`Reference`
+> на уровень выше — используй `--calibration-dir ..` и пути `../Reference/...`.
+
+---
+
+## Подробные пояснения по каждому уровню
 
 ## 0. Доступ к коду в VM через общую папку
 
@@ -71,9 +140,9 @@ pytest -v
 
 ```bash
 python -m multicam.cli process \
-    --object ../Reference/fr_14_41_17_557.bmp \
-    --reference ../Reference/fr_14_41_17_557.bmp \
-    --distance 1.0 --calibration-dir .. \
+    --object /Reference/fr_14_41_17_557.bmp \
+    --reference /Reference/fr_14_41_17_557.bmp \
+    --distance 1.0 --calibration-dir  \
     --roi 100 400 100 400 \
     --output result.txt
 ```
@@ -95,38 +164,124 @@ python -m multicam.cli process --object ../Reference/fr_14_41_17_557.bmp \
     --calibration-dir .. --custom-index "x650 / x900" --maps
 ```
 
-## Уровень 3 — живой захват (Jetson + камера)
+## Диагностика окружения — команда `doctor`
 
-В обычной VirtualBox это делать не рекомендуется (USB3-камера капризна к проброшенному
-USB). Делаем на реальном Jetson Orin Nano.
-
-### 3.1 Установка SDK под Linux arm64
-
-1. Скачать SDK ToupTek (раздел Development Kits) с
-   [официального центра загрузок](https://www.touptekphotonics.com/download/).
-2. Взять из него `arm64/libnncam.so` (или `libtoupcam.so`) и udev-правило
-   `99-toupcam.rules`.
-3. Установить:
+Перед попыткой работы с камерой запусти диагностику. Она проверяет платформу,
+архитектуру, Python-зависимости, загрузку SDK, наличие устройства в `lsusb` и
+перечисление камер:
 
 ```bash
-sudo cp libnncam.so /usr/local/lib/ && sudo ldconfig
-sudo cp 99-toupcam.rules /etc/udev/rules.d/
-sudo udevadm control --reload-rules && sudo udevadm trigger
+python -m multicam.cli doctor
 ```
 
-### 3.2 Проверка обнаружения и захвата
+По выводу сразу видно, чего не хватает (модуль, библиотека, USB-устройство, udev).
+
+## Уровень 3 — живой захват с камеры
+
+> ⚠️ **Важно про архитектуру.** Библиотека `libnncam.so` должна совпадать с
+> архитектурой системы, где запущен Python:
+> * **Ubuntu в VirtualBox на ноутбуке = x86_64 → нужен `x64/libnncam.so`** (НЕ arm64!);
+> * **реальный Jetson Orin Nano = aarch64 → нужен `arm64/libnncam.so`**.
+> Это самая частая ошибка: берут arm64-файл для VM и получают «не загружается».
+
+### 3A. Живой тест в VirtualBox (proof-of-concept на ноутбуке)
+
+Это законный способ убедиться, что камера в принципе видна Linux и отдаёт кадр.
+Полноценную стабильность стрима в VM не гарантируем — финал всё равно на Jetson.
+
+**Шаг 1. Включить USB в VirtualBox**
+1. Установить **VirtualBox Extension Pack** той же версии, что и VirtualBox
+   (без него нет USB 2.0/3.0).
+2. ВМ выключить → **Settings → USB** → выбрать **USB 3.0 (xHCI)**.
+3. Нажать «+», добавить камеру в **USB Device Filters** (чтобы пробрасывалась автоматически).
+4. На хосте (Windows) закрыть штатное ПО MultiCam, чтобы оно не держало камеру.
+
+**Шаг 2. Дать права на USB внутри Ubuntu**
+```bash
+sudo usermod -aG vboxusers $USER   # затем перелогиниться
+```
+
+**Шаг 3. Подключить камеру и проверить, что Linux её видит**
+```bash
+lsusb        # в списке должно появиться устройство камеры (ToupTek/похожее)
+```
+Если в `lsusb` устройства нет — проблема в пробросе VirtualBox (фильтр/Extension Pack),
+а не в нашем коде.
+
+**Шаг 4. Положить x64-библиотеку и запустить диагностику**
+```bash
+python -m multicam.cli doctor --lib ~/obshaya/libnncam.so
+```
+
+**Шаг 5. ОБЯЗАТЕЛЬНО: установить udev-правило (иначе ошибка доступа)**
+
+Без udev-правила `probe` может находить камеру, но `capture` падает на старте потока
+с ошибкой `HRESULT=0x80070005` (E_ACCESSDENIED) — у процесса нет прав на чтение/запись
+USB-устройства. Лечится так:
 
 ```bash
-# Камера должна определиться без root (через udev-правило):
-python -m multicam.cli probe
+sudo cp ~/obshaya/99-toupcam.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+# затем ФИЗИЧЕСКИ переподключить камеру (вынуть-вставить USB)
+```
 
-# Захват 5 кадров:
+> Быстрая проверка, что проблема именно в правах: запуск под root должен срабатывать —
+> `sudo ~/venvs/multicam/bin/python -m multicam.cli capture --backend nncam --count 1 --lib ~/obshaya/libnncam.so --output-dir captures`.
+> Если под `sudo` работает, а без — нет, значит дело в udev (правило не применилось/не переподключили камеру).
+
+**Шаг 6. Обнаружение и захват**
+```bash
+python -m multicam.cli probe --lib ~/obshaya/libnncam.so
+
+python -m multicam.cli capture --backend nncam --count 5 \
+    --exposure 10000 --output-dir captures --lib ~/obshaya/libnncam.so
+```
+
+> Если `probe` находит камеру, но `capture` рвётся/таймаутит (а доступ уже починен) —
+> это нестабильность USB3 в VirtualBox. Снизь нагрузку (меньше кадров, больше
+> `--timeout`), воткни в USB-порт напрямую без хабов, либо переходи к Jetson.
+
+### Что делать, если кадр 0 снялся, а дальше `TimeoutError`
+
+Это самый типичный симптом в VirtualBox: первый кадр приходит, непрерывный поток
+обрывается. Это **ограничение виртуалки, а не кода**. Варианты по возрастанию усилий:
+
+1. **Снимать с паузой и ретраями** (код уже умеет):
+   ```bash
+   python -m multicam.cli capture --backend nncam --count 5 \
+     --lib ~/obshaya/libnncam.so --output-dir captures \
+     --interval 1.0 --retries 5 --timeout 15
+   ```
+   Пауза между кадрами даёт USB-стеку VM «выдохнуть», ретраи переживают единичные срывы.
+2. **Снимать по одному кадру** — единичный захват работает стабильно:
+   ```bash
+   python -m multicam.cli capture --backend nncam --count 1 --lib ~/obshaya/libnncam.so
+   ```
+   Для дрона это и есть основной сценарий (периодические снимки, а не видео).
+3. **Сменить контроллер USB в настройках VM** на **USB 2.0 (EHCI)** — медленнее, но для
+   изохронного потока часто стабильнее, чем эмуляция USB 3.0 (xHCI).
+4. **Перейти на Jetson** — там нативный USB, без прослойки виртуализации, поток ровный.
+
+### 3B. Финальный тест на Jetson Orin Nano (aarch64)
+
+```bash
+# arm64-библиотека + udev-правило из SDK ToupTek:
+sudo cp arm64/libnncam.so /usr/local/lib/ && sudo ldconfig
+sudo cp 99-toupcam.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+
+python -m multicam.cli doctor
+python -m multicam.cli probe
 python -m multicam.cli capture --backend nncam --count 5 \
     --exposure 10000 --output-dir captures
 ```
 
+SDK ToupTek (x64 и arm64 в одном архиве) — раздел Development Kits на
+[официальном центре загрузок](https://www.touptekphotonics.com/download/).
+
 Дальше эти кадры прогоняем через `process` (уровень 2) — так замыкаем полный цикл
-«камера → обработка → индексы» уже на целевом железе.
+«камера → обработка → индексы».
 
 ## Тест mock-камеры (имитация захвата в VM)
 
@@ -139,9 +294,14 @@ python -m multicam.cli capture --backend mock \
 
 ## Чек-лист «всё ок»
 
-- [ ] `selftest` → все индексы OK
-- [ ] `pytest` → зелёный
-- [ ] `process` на BMP → выводит спектр и индексы, пишет `result.txt`
-- [ ] (Jetson) `probe` находит камеру
-- [ ] (Jetson) `capture` сохраняет кадры
+- [x] `selftest` → все индексы OK
+- [x] `pytest` → зелёный
+- [x] `process` на BMP → выводит спектр и индексы, пишет `result.txt`
+- [x] `doctor` → зависимости и SDK без FAIL
+- [x] (VM) `lsusb` видит камеру
+- [x] (VM) `probe` находит камеру
+- [x] udev-правило установлено, ошибка доступа `0x80070005` устранена
+- [x] (VM) `capture` сохраняет кадры ← **получен живой кадр 2048×2048**
 - [ ] спектр/индексы из нашего пайплайна совпадают с выводом штатного ПО на тех же кадрах
+- [ ] карта «тайл → длина волны» сверена с реальным кадром (`config/channels.yaml`)
+- [ ] (Jetson) повторить прогон с `arm64/libnncam.so`

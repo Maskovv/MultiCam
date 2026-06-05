@@ -1,0 +1,11 @@
+Start time: 10/03/2023 14:41:16
+Custom Note: 
+Camera name: BigEye4200KME
+Files path: C:/Users/Анастасия/Desktop/MultiSense/s_10_03_23_14_41_16
+Exposure, us: 77088
+Gain, %: 100
+Frame rate, Hz: 0
+Width, px: 2048
+Height, px: 2048
+Offset X, px: 0
+Offset Y, px: 0
