@@ -16,9 +16,11 @@ MultiCam (по импортам MultiCam.exe):
 from __future__ import annotations
 
 import ctypes as C
+import os
 import platform
 import sys
 from ctypes.util import find_library
+from pathlib import Path
 
 NNCAM_MAX = 16
 
@@ -94,18 +96,74 @@ def _candidate_lib_names() -> list[str]:
     return ["libnncam.so", "libtoupcam.so"]
 
 
+def _search_dirs() -> list[Path]:
+    """Каталоги, где ищем библиотеку, помимо системных путей.
+
+    Порядок: переменная окружения MULTICAM_NNCAM_LIB (файл или папка),
+    папка пакета multicam/, папка multicam/lib/, текущий рабочий каталог.
+    Это позволяет просто положить libnncam.so рядом с кодом и не настраивать
+    LD_LIBRARY_PATH.
+    """
+    dirs: list[Path] = []
+    env = os.environ.get("MULTICAM_NNCAM_LIB")
+    if env:
+        p = Path(env)
+        dirs.append(p.parent if p.is_file() else p)
+    pkg_dir = Path(__file__).resolve().parent.parent  # .../multicam
+    dirs.extend([pkg_dir, pkg_dir / "lib", Path.cwd()])
+    # Уникализируем, сохраняя порядок.
+    seen: set[Path] = set()
+    uniq: list[Path] = []
+    for d in dirs:
+        if d not in seen:
+            seen.add(d)
+            uniq.append(d)
+    return uniq
+
+
 def load_library(explicit_path: str | None = None) -> C.CDLL:
-    """Загружает разделяемую библиотеку SDK."""
+    """Загружает разделяемую библиотеку SDK.
+
+    Порядок поиска:
+      1) явный путь (--lib) или MULTICAM_NNCAM_LIB, если это файл;
+      2) библиотека рядом с проектом (папка пакета, multicam/lib, cwd);
+      3) системные пути загрузчика (LD_LIBRARY_PATH и т.п.);
+      4) find_library как последняя попытка.
+    """
     errors: list[str] = []
-    names = [explicit_path] if explicit_path else _candidate_lib_names()
+
+    # 1) Явный путь к конкретному файлу.
+    env_file = os.environ.get("MULTICAM_NNCAM_LIB")
+    explicit_candidates = [explicit_path]
+    if env_file and Path(env_file).is_file():
+        explicit_candidates.append(env_file)
+    for cand in explicit_candidates:
+        if cand and Path(cand).is_file():
+            try:
+                return C.CDLL(str(Path(cand).resolve()))
+            except OSError as exc:
+                errors.append(f"{cand}: {exc}")
+
+    names = _candidate_lib_names()
+
+    # 2) Рядом с проектом.
+    for d in _search_dirs():
+        for name in names:
+            candidate = d / name
+            if candidate.is_file():
+                try:
+                    return C.CDLL(str(candidate.resolve()))
+                except OSError as exc:
+                    errors.append(f"{candidate}: {exc}")
+
+    # 3) Системные пути загрузчика (по «голому» имени).
     for name in names:
-        if not name:
-            continue
         try:
             return C.CDLL(name)
         except OSError as exc:
             errors.append(f"{name}: {exc}")
-    # Последняя попытка — через find_library.
+
+    # 4) find_library.
     for base in ("nncam", "toupcam"):
         found = find_library(base)
         if found:
@@ -113,10 +171,13 @@ def load_library(explicit_path: str | None = None) -> C.CDLL:
                 return C.CDLL(found)
             except OSError as exc:
                 errors.append(f"{found}: {exc}")
+
     raise OSError(
-        "Не удалось загрузить SDK камеры (libnncam.so / nncam.dll). "
-        "Проверь, что библиотека лежит рядом или в LD_LIBRARY_PATH.\n"
-        + "\n".join(errors)
+        "Не удалось загрузить SDK камеры (libnncam.so / nncam.dll).\n"
+        "Положи библиотеку рядом с проектом (папка multicam/ или multicam/lib/), "
+        "либо укажи путь через --lib / переменную MULTICAM_NNCAM_LIB, "
+        "либо добавь её каталог в LD_LIBRARY_PATH.\n"
+        "Подробности попыток загрузки:\n  " + "\n  ".join(errors)
     )
 
 

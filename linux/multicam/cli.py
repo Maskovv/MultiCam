@@ -110,26 +110,161 @@ def _cmd_probe(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_doctor(args: argparse.Namespace) -> int:
+    """Диагностика окружения: платформа, зависимости, SDK, USB, камера."""
+    import platform
+    import shutil
+    import subprocess
+
+    ok = True
+
+    print("=== MultiCam doctor ===\n")
+
+    # 1) Платформа и Python.
+    print(f"Платформа : {platform.system()} {platform.release()}")
+    print(f"Архитектура: {platform.machine()}  (для этой арки нужен соответствующий libnncam.so)")
+    print(f"Python    : {platform.python_version()}\n")
+
+    # 2) Python-зависимости.
+    for mod in ("numpy", "cv2", "yaml"):
+        try:
+            m = __import__(mod)
+            ver = getattr(m, "__version__", "?")
+            print(f"  [OK ] модуль {mod} ({ver})")
+        except ImportError:
+            opt = mod == "yaml"
+            print(f"  [{'WARN' if opt else 'FAIL'}] модуль {mod} не установлен"
+                  + ("  (нужен только для config/channels.yaml)" if opt else ""))
+            if not opt:
+                ok = False
+    print()
+
+    # 3) Загрузка SDK камеры.
+    try:
+        from .camera import nncam_sdk
+        sdk = nncam_sdk.NncamSDK(args.lib)
+        ver_fn = getattr(sdk.lib, "Nncam_Version", None) or getattr(sdk.lib, "Toupcam_Version", None)
+        ver = ""
+        if ver_fn is not None:
+            ver_fn.restype = C.c_char_p if sys.platform != "win32" else C.c_wchar_p
+            try:
+                raw = ver_fn()
+                ver = raw.decode() if isinstance(raw, bytes) else str(raw)
+            except Exception:
+                ver = "(не удалось получить версию)"
+        print(f"  [OK ] SDK камеры загружен  версия: {ver}")
+    except OSError as exc:
+        ok = False
+        print(f"  [FAIL] SDK камеры не загружен:\n      {exc}")
+        sdk = None
+    print()
+
+    # 4) lsusb (Linux): подсказка по USB-подключению.
+    if shutil.which("lsusb"):
+        try:
+            out = subprocess.run(["lsusb"], capture_output=True, text=True, timeout=5).stdout
+            hits = [ln for ln in out.splitlines()
+                    if any(k in ln.lower() for k in ("touptek", "nncam", "bigeye", "0547", "549a"))]
+            if hits:
+                print("  [OK ] похожее USB-устройство найдено:")
+                for ln in hits:
+                    print(f"        {ln}")
+            else:
+                print("  [WARN] в lsusb не видно знакомого устройства камеры.")
+                print("         В VirtualBox проверь USB-фильтр и Extension Pack.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [WARN] не удалось выполнить lsusb: {exc}")
+    else:
+        print("  [..] lsusb недоступен (не Linux или не установлен) — пропускаю USB-проверку.")
+    print()
+
+    # 5) Перечисление камер через SDK.
+    if sdk is not None:
+        try:
+            from .camera.nncam_backend import NncamCamera
+            cam = NncamCamera(lib_path=args.lib)
+            cams = cam.enumerate()
+            if cams:
+                print(f"  [OK ] камер обнаружено: {len(cams)}")
+                for i, info in enumerate(cams):
+                    print(f"        [{i}] {info.name}  id={info.device_id}")
+            else:
+                print("  [WARN] SDK загружен, но камера не обнаружена (Enum вернул 0).")
+                print("         Проверь питание/кабель USB3, udev-правило и проброс USB в VM.")
+        except Exception as exc:  # noqa: BLE001
+            print(f"  [WARN] ошибка перечисления камер: {exc}")
+
+    print("\nИтог:", "окружение готово" if ok else "есть проблемы (см. FAIL выше)")
+    return 0 if ok else 1
+
+
 def _cmd_capture(args: argparse.Namespace) -> int:
-    import cv2  # noqa: WPS433
     from .camera import open_camera
+
+    # cv2 нужен только для png/tiff; для npy обходимся без OpenCV.
+    cv2 = None
+    if args.format != "npy":
+        import cv2  # noqa: WPS433
+
+    import time
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     cam = open_camera(backend=args.backend, lib_path=args.lib, frame_path=args.mock_frame)
     info = cam.open()
     print(f"Открыта камера: {info.name} {info.width}x{info.height}")
+    ext = {"png": ".png", "tiff": ".tiff", "npy": ".npy"}[args.format]
+    warned_8bit = False
+    saved = 0
     try:
         if args.exposure:
             cam.set_exposure(args.exposure)
         for i in range(args.count):
-            frame, finfo = cam.grab(timeout_s=args.timeout)
-            path = out_dir / f"frame_{i:04d}.png"
-            cv2.imwrite(str(path), frame)
-            print(f"  кадр {i}: {path}  ({finfo.width}x{finfo.height}, ts={finfo.timestamp_us})")
+            # Устойчивость к срывам потока (актуально для USB3 в VirtualBox):
+            # на таймаут делаем несколько повторных попыток получить кадр.
+            frame = finfo = None
+            for attempt in range(args.retries + 1):
+                try:
+                    frame, finfo = cam.grab(timeout_s=args.timeout)
+                    break
+                except TimeoutError:
+                    if attempt < args.retries:
+                        print(f"  [retry] кадр {i}: таймаут, попытка "
+                              f"{attempt + 2}/{args.retries + 1}...")
+                        time.sleep(0.2)
+                    else:
+                        print(f"  [skip] кадр {i}: не пришёл за "
+                              f"{args.retries + 1} попыток — пропускаю.")
+            if frame is None:
+                continue
+
+            # Защита битности: для мультиспектра важно сохранять полную разрядность
+            # без потерь. Предупреждаем, если кадр неожиданно оказался 8-битным.
+            if frame.dtype == np.uint8 and not warned_8bit:
+                print("  [WARN] кадр пришёл 8-битным — для спектрального анализа "
+                      "желательно 16 бит (проверь raw/bitdepth камеры).")
+                warned_8bit = True
+
+            path = out_dir / f"frame_{i:04d}{ext}"
+            if args.format == "npy":
+                # Точное побайтовое сохранение массива (гарантированно без потерь).
+                np.save(str(path), frame)
+            else:
+                # PNG и TIFF — оба без потерь и поддерживают 16 бит (uint16 сохранится).
+                ok = cv2.imwrite(str(path), frame)
+                if not ok:
+                    raise SystemExit(f"Не удалось сохранить кадр в {path}")
+            saved += 1
+            print(f"  кадр {i}: {path}  ({finfo.width}x{finfo.height}, "
+                  f"{frame.dtype}, ts={finfo.timestamp_us})")
+
+            # Пауза между кадрами — даёт USB-стеку VM «передохнуть».
+            if args.interval > 0 and i < args.count - 1:
+                time.sleep(args.interval)
     finally:
         cam.close()
-    return 0
+    print(f"\nИтого сохранено кадров: {saved} из {args.count}")
+    return 0 if saved > 0 else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -157,14 +292,27 @@ def build_parser() -> argparse.ArgumentParser:
     pb.add_argument("--lib", help="путь к libnncam.so / nncam.dll")
     pb.set_defaults(func=_cmd_probe)
 
+    dc = sub.add_parser("doctor", help="диагностика окружения (платформа, зависимости, SDK, USB)")
+    dc.add_argument("--lib", help="путь к libnncam.so / nncam.dll")
+    dc.set_defaults(func=_cmd_doctor)
+
     cap = sub.add_parser("capture", help="захват кадров в файлы")
     cap.add_argument("--backend", default="auto", choices=["auto", "nncam", "mock"])
     cap.add_argument("--lib", help="путь к libnncam.so / nncam.dll")
     cap.add_argument("--mock-frame", help="кадр/папка для mock-бэкенда")
     cap.add_argument("--count", type=int, default=1)
     cap.add_argument("--exposure", type=int, help="экспозиция, мкс")
-    cap.add_argument("--timeout", type=float, default=5.0)
+    cap.add_argument("--timeout", type=float, default=10.0,
+                     help="ожидание одного кадра, с (по умолчанию 10)")
+    cap.add_argument("--retries", type=int, default=3,
+                     help="повторных попыток на кадр при таймауте (для нестабильного USB в VM)")
+    cap.add_argument("--interval", type=float, default=0.0,
+                     help="пауза между кадрами, с (помогает USB в VirtualBox)")
     cap.add_argument("--output-dir", default="captures")
+    cap.add_argument("--format", default="png", choices=["png", "tiff", "npy"],
+                     help="формат сохранения (все без потерь, 16 бит): "
+                          "png — универсально; tiff — научный стандарт (и под GeoTIFF); "
+                          "npy — точный numpy-массив")
     cap.set_defaults(func=_cmd_capture)
 
     return p
